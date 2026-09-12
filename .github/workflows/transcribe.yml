@@ -1,1 +1,38 @@
+name: Transcribe Audio
 
+on:
+  repository_dispatch:
+    types: [transcribe]
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install faster-whisper requests
+
+      - name: Run transcription
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_OWNER: ${{ github.repository_owner }}
+          GH_REPO: ${{ github.event.repository.name }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+          RELEASE_TAG: ${{ github.event.client_payload.release_tag }}
+          ASSET_ID: ${{ github.event.client_payload.asset_id }}
+          TRANSCRIPT_ASSET_ID: ${{ github.event.client_payload.transcript_asset_id }}
+          MODEL: ${{ github.event.client_payload.model }}
+          LANGUAGE: ${{ github.event.client_payload.language }}
+          MODE: ${{ github.event.client_payload.mode }}
+          ORIG_FILENAME: ${{ github.event.client_payload.orig_filename }}
+          TG_CHAT_ID: ${{ github.event.client_payload.tg_chat_id }}
+          TG_STATUS_MSG_ID: ${{ github.event.client_payload.tg_status_msg_id }}
+        run: python scripts/transcribe.py
