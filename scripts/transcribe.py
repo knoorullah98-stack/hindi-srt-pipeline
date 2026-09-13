@@ -1,6 +1,7 @@
 import os
 import time
 import subprocess
+import threading
 import requests
 
 # Maximize CPU usage on GitHub runner
@@ -51,6 +52,7 @@ def gh_request(method, url, **kwargs):
 
 
 def tg_edit_status(text):
+    """Edit the Telegram status message and report API failures clearly."""
     try:
         res = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
@@ -58,9 +60,15 @@ def tg_edit_status(text):
             timeout=30,
         )
         if not res.ok:
-            print(f"Telegram status update failed: {res.status_code} {res.text[:300]}")
+            body = res.text[:500]
+            # Telegram returns 400 when the text is identical; that is harmless.
+            if "message is not modified" not in body.lower():
+                print(f"Telegram status update failed: {res.status_code} {body}", flush=True)
+                return False
+        return True
     except requests.RequestException as e:
-        print(f"Telegram status update exception: {e}")
+        print(f"Telegram status update exception: {e}", flush=True)
+        return False
 
 
 def tg_send_document(path):
@@ -140,43 +148,82 @@ def write_srt(segments, out_path):
 
 
 class ProgressTracker:
-    """Telegram progress/ETA updater for a single transcription job."""
+    """Live Telegram progress updater for a single transcription job.
 
-    def __init__(self, duration):
+    faster-whisper exposes progress when segments are yielded, not during the
+    internal decoding of a segment. A heartbeat thread therefore keeps the
+    Telegram message alive even while Whisper is busy producing the next
+    segment. Percentage/ETA are only calculated from real processed audio.
+    """
+
+    def __init__(self, duration, prefix):
         self.duration = duration
+        self.prefix = prefix
         self.started = time.monotonic()
+        self.last_processed = 0.0
         self.last_update = 0.0
-        self.last_pct = -1
+        self.last_text = ""
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+        self.thread.start()
 
-    def update(self, processed_seconds, prefix):
-        if not self.duration or processed_seconds is None:
-            return
+    def _build_text(self):
+        with self.lock:
+            processed = self.last_processed
 
-        pct = min(99, max(0, int((processed_seconds / self.duration) * 100)))
         elapsed = time.monotonic() - self.started
+        if self.duration and processed > 0:
+            pct = min(99, max(0, int((processed / self.duration) * 100)))
+            speed = processed / elapsed if elapsed > 0 else 0
+            remaining = (self.duration - processed) / speed if speed > 0 else None
+            eta = f"~{format_duration(remaining)}" if remaining is not None else "calculating…"
+            return (
+                f"{self.prefix}\n"
+                f"📊 Progress: {pct}%\n"
+                f"🎧 Processed: {format_duration(processed)} / {format_duration(self.duration)}\n"
+                f"⏱ Elapsed: {format_duration(elapsed)}\n"
+                f"🕒 ETA: {eta}"
+            )
 
-        # Avoid noisy Telegram edits. Update roughly every 15s or every 5%.
-        if elapsed < 8:
-            return
-        if pct < 5:
-            return
-        if (pct - self.last_pct) < 5 and (time.monotonic() - self.last_update) < 15:
-            return
-
-        remaining = None
-        if pct > 0:
-            remaining = elapsed * (100 - pct) / pct
-
-        eta_text = f"~{format_duration(remaining)}" if remaining is not None else "calculating…"
-        text = (
-            f"{prefix}\n"
-            f"📊 Progress: {pct}%\n"
+        return (
+            f"{self.prefix}\n"
+            f"📊 Progress: 0%\n"
             f"⏱ Elapsed: {format_duration(elapsed)}\n"
-            f"🕒 ETA: {eta_text}"
+            f"🕒 ETA: calculating…\n"
+            f"⏳ Whisper is processing…"
         )
+
+    def _heartbeat(self):
+        # First heartbeat is deliberately delayed so the initial Telegram
+        # message remains stable for a moment. Then update every 10 seconds.
+        while not self.stop_event.wait(10):
+            text = self._build_text()
+            with self.lock:
+                if text == self.last_text:
+                    continue
+                self.last_text = text
+            tg_edit_status(text)
+            self.last_update = time.monotonic()
+
+    def update(self, processed_seconds):
+        if processed_seconds is None:
+            return
+        with self.lock:
+            self.last_processed = max(self.last_processed, float(processed_seconds))
+
+        # Push immediately when a new meaningful segment arrives.
+        text = self._build_text()
+        with self.lock:
+            if text == self.last_text:
+                return
+            self.last_text = text
         tg_edit_status(text)
         self.last_update = time.monotonic()
-        self.last_pct = pct
+
+    def stop(self):
+        self.stop_event.set()
+        self.thread.join(timeout=2)
 
 
 def normal_asr(audio_path, duration):
@@ -215,15 +262,15 @@ def normal_asr(audio_path, duration):
         f"🕒 ETA: calculating…"
     )
 
-    tracker = ProgressTracker(duration)
+    tracker = ProgressTracker(duration, f"🧠 Transcribing ({MODEL})…")
     result = []
 
-    for s in segments:
-        result.append((s.start, s.end, s.text))
-        tracker.update(
-            s.end,
-            f"🧠 Transcribing ({MODEL})…"
-        )
+    try:
+        for s in segments:
+            result.append((s.start, s.end, s.text))
+            tracker.update(s.end)
+    finally:
+        tracker.stop()
 
     return result
 
@@ -265,13 +312,16 @@ def forced_align(audio_path, transcript_path, duration):
         f"🕒 ETA: calculating…"
     )
 
-    tracker = ProgressTracker(duration)
+    tracker = ProgressTracker(duration, f"🧠 Forced-align chal raha hai ({MODEL})…")
     asr_words = []
 
-    for seg in segments:
-        for w in seg.words:
-            asr_words.append((w.start, w.end))
-        tracker.update(seg.end, f"🧠 Forced-align chal raha hai ({MODEL})…")
+    try:
+        for seg in segments:
+            for w in seg.words:
+                asr_words.append((w.start, w.end))
+            tracker.update(seg.end)
+    finally:
+        tracker.stop()
 
     with open(transcript_path, "r", encoding="utf-8") as f:
         script_words = f.read().split()
